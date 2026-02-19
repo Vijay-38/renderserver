@@ -43,6 +43,12 @@ async def websocket_handler(request):
                             'state': {'pos': {'x': 0, 'y': 150, 'z': 0}, 'heading': 0, 'pitch': 0, 'roll': 0, 'speed': 0}
                         }
 
+                        # Send welcome message with player ID
+                        await ws.send_json({
+                            'type': 'welcome',
+                            'playerId': player_id
+                        })
+
                         # Send room state to new player
                         players = {pid: p['state'] for pid, p in rooms[room_name].items() if pid != player_id}
                         await ws.send_json({
