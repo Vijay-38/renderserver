@@ -1,97 +1,112 @@
-const { WebSocketServer } = require('ws');
+#!/usr/bin/env python3
+"""
+WebSocket Server for Multiplayer Jet Game
+Install: pip install websockets
+Run: python server.py
+"""
 
-const wss = new WebSocketServer({ port: 8080 });
+import asyncio
+import websockets
+import json
+import uuid
+from collections import defaultdict
 
-const rooms = new Map();
+rooms = defaultdict(dict)  # room_name -> {player_id: player_data}
 
-function broadcast(room, message, excludeId = null) {
-  room.forEach((player) => {
-    if (player.id !== excludeId && player.ws.readyState === 1) {
-      player.ws.send(JSON.stringify(message));
-    }
-  });
-}
 
-wss.on('connection', (ws) => {
-  let playerId = null;
-  let currentRoom = null;
-  let roomName = null;
+async def handle_client(websocket, path):
+    player_id = str(uuid.uuid4())[:8]
+    current_room = None
+    player_state = None
+    
+    print(f"Player {player_id} connected")
 
-  console.log('Player connected');
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                msg_type = data.get('type')
 
-  ws.on('message', (data) => {
-    try {
-      const message = JSON.parse(data);
-      
-      switch (message.type) {
-        case 'welcome':
-          playerId = message.playerId;
-          console.log('Player ID assigned:', playerId);
-          break;
-          
-        case 'join':
-          roomName = message.roomName || 'default';
-          
-          if (!rooms.has(roomName)) {
-            rooms.set(roomName, new Map());
-          }
-          currentRoom = rooms.get(roomName);
-          currentRoom.set(playerId, { ws, id: playerId });
-          
-          // Send room state to new player
-          const players = {};
-          currentRoom.forEach((p, id) => {
-            if (id !== playerId) players[id] = p.state;
-          });
-          ws.send(JSON.stringify({ type: 'room-state', players }));
-          
-          // Notify others
-          broadcast(currentRoom, { 
-            type: 'player-joined', 
-            playerId, 
-            state: { pos: { x: 0, y: 150, z: 0 }, heading: 0, pitch: 0, roll: 0, speed: 0 }
-          }, playerId);
-          
-          console.log(`Player ${playerId} joined room ${roomName}`);
-          break;
-          
-        case 'update':
-          if (currentRoom && playerId) {
-            const player = currentRoom.get(playerId);
-            if (player) {
-              player.state = message.state;
-              broadcast(currentRoom, { 
-                type: 'player-update', 
-                playerId, 
-                state: message.state 
-              }, playerId);
-            }
-          }
-          break;
-          
-        case 'leave':
-          if (currentRoom && playerId) {
-            currentRoom.delete(playerId);
-            broadcast(currentRoom, { type: 'player-left', playerId });
-            
-            if (currentRoom.size === 0) {
-              rooms.delete(roomName);
-            }
-          }
-          break;
-      }
-    } catch (e) {
-      console.error('Error processing message:', e);
-    }
-  });
+                if msg_type == 'join':
+                    room_name = data.get('roomName', 'default')
+                    current_room = room_name
+                    
+                    rooms[room_name][player_id] = {
+                        'websocket': websocket,
+                        'state': {'pos': {'x': 0, 'y': 150, 'z': 0}, 'heading': 0, 'pitch': 0, 'roll': 0, 'speed': 0}
+                    }
 
-  ws.on('close', () => {
-    if (currentRoom && playerId) {
-      currentRoom.delete(playerId);
-      broadcast(currentRoom, { type: 'player-left', playerId });
-      console.log(`Player ${playerId} disconnected`);
-    }
-  });
-});
+                    # Send room state to new player
+                    players = {pid: p['state'] for pid, p in rooms[room_name].items() if pid != player_id}
+                    await websocket.send(json.dumps({
+                        'type': 'room-state',
+                        'players': players
+                    }))
 
-console.log('WebSocket server running on port 8080');
+                    # Notify others
+                    broadcast(room_name, {
+                        'type': 'player-joined',
+                        'playerId': player_id,
+                        'state': {'pos': {'x': 0, 'y': 150, 'z': 0}, 'heading': 0, 'pitch': 0, 'roll': 0, 'speed': 0}
+                    }, exclude_id=player_id)
+
+                    print(f"Player {player_id} joined room {room_name}")
+
+                elif msg_type == 'update':
+                    if current_room and player_id in rooms[current_room]:
+                        player_state = data.get('state')
+                        rooms[current_room][player_id]['state'] = player_state
+                        broadcast(current_room, {
+                            'type': 'player-update',
+                            'playerId': player_id,
+                            'state': player_state
+                        }, exclude_id=player_id)
+
+                elif msg_type == 'leave':
+                    if current_room and player_id in rooms[current_room]:
+                        del rooms[current_room][player_id]
+                        broadcast(current_room, {'type': 'player-left', 'playerId': player_id})
+                        if not rooms[current_room]:
+                            del rooms[current_room]
+                        current_room = None
+
+            except json.JSONDecodeError:
+                print(f"Invalid JSON from {player_id}")
+
+    except websockets.exceptions.ConnectionClosed:
+        print(f"Player {player_id} disconnected")
+    finally:
+        if current_room and player_id in rooms[current_room]:
+            del rooms[current_room][player_id]
+            broadcast(current_room, {'type': 'player-left', 'playerId': player_id})
+            if not rooms[current_room]:
+                del rooms[current_room]
+
+
+def broadcast(room_name, message, exclude_id=None):
+    """Broadcast message to all players in a room except excluded player"""
+    if room_name not in rooms:
+        return
+    
+    msg_str = json.dumps(message)
+    
+    for pid, player_data in rooms[room_name].items():
+        if pid != exclude_id:
+            try:
+                asyncio.create_task(player_data['websocket'].send(msg_str))
+            except:
+                pass
+
+
+async def main():
+    print("Starting WebSocket server on port 8080...")
+    async with websockets.serve(handle_client, "0.0.0.0", 8080):
+        print("Server running. Press Ctrl+C to stop.")
+        await asyncio.Future()  # Run forever
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
