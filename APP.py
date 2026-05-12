@@ -1446,25 +1446,215 @@ def groq_verify_article(user):
         description = data.get("description", "")
         api_keys = data.get("api_keys") or [data.get("api_key", "")]
         deep = data.get("deep", "false").lower() == "true"
+        lang = data.get("lang", "en")
+        article_source = data.get("source", "")
+        url = data.get("url", "")
     else:
         title = request.args.get("title")
         description = request.args.get("description", "")
         api_keys = request.args.getlist("api_keys") or [request.args.get("api_key", "")]
         deep = request.args.get("deep", "false").lower() == "true"
+        lang = request.args.get("lang", "en")
+        article_source = request.args.get("source", "")
+        url = request.args.get("url", "")
 
-    cache_key = get_cache_key({"groq_verify": title, "deep": deep})
+    if not ensure_list(api_keys) and user:
+        db_keys = _get_user_api_keys(user, 'groq')
+        api_keys = ensure_list(db_keys.get('groq', []))
+
+    has_groq = bool(ensure_list(api_keys))
+    use_compound = deep
+    model_name = "groq/compound" if use_compound else "llama-3.1-8b-instant"
+
+    cache_key = get_cache_key({"groq_verify": title, "deep": deep, "lang": lang})
     cached = get_cached(cache_key)
     if cached:
         return jsonify(cached)
 
-    response_data = {
-        "verdict": "Unverified",
-        "confidence": "Low",
-        "reasoning": "Verification skipped in consolidated mode.",
-        "key_points": []
-    }
-    set_cache(cache_key, response_data)
-    return jsonify(response_data)
+    full_text = ""
+    if deep:
+        if request.method == "GET":
+            url = request.args.get("url", "")
+        if url:
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                resp = requests.get(url, headers=headers, timeout=2000)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                        tag.decompose()
+                    full_text = soup.get_text(separator=' ', strip=True)[:3000]
+            except Exception as e:
+                logger.warning(f"Failed to fetch article: {e}")
+
+    content = f"Title: {title[:200]}"
+    if description:
+        content += f"\n\nDescription: {description[:300]}"
+    if full_text:
+        content += f"\n\nFull Article Content:\n{full_text[:1000]}"
+
+    language_names = {"en": "English", "hi": "Hindi", "mr": "Marathi"}
+    response_lang = language_names.get(lang, "English")
+
+    grounding_sources = []
+    tavily_snippets = ""
+    tavily_answer = ""
+    if not use_compound:
+        try:
+            tavily_sources, tavily_answer, tavily_content = search_tavily(title)
+            grounding_sources.extend(tavily_sources)
+            if tavily_content:
+                tavily_snippets = "\n\nRelevant web search results:\n" + tavily_content
+        except Exception as e:
+            logger.warning(f"Tavily search error: {e}")
+
+    prompt = f"""Analyze this news article for credibility, truthfulness, and tone. Respond in {response_lang}.
+
+{content}
+{tavily_snippets}
+
+Provide your analysis in JSON format with these fields:
+- verdict: one of "True", "Misleading", "False", "Unverified"
+- confidence: one of "High", "Medium", "Low"
+- reasoning: a clear explanation of WHY you believe the article is true, misleading, or false. Be specific about what makes it credible or questionable. Write in {response_lang}.
+- key_points: an array of 2-3 key points supporting your verdict. Write each point in {response_lang}.
+- sentiment: an object with:
+  - overall: one of "positive", "negative", "neutral", "mixed"
+  - tone: short description of the article's tone (e.g. "critical", "supportive", "analytical", "sensationalist", "fearful", "celebratory")
+  - emotional_charge: one of "high", "medium", "low"
+  - subjectivity: a number from 0 (completely objective) to 1 (completely subjective)
+
+Only respond with valid JSON, nothing else."""
+
+    if len(prompt) > 4000:
+        return jsonify({
+            "error": "Article is too long for analysis. Try a shorter article.",
+            "error_type": "too_large",
+            "verdict": "Unverified",
+            "confidence": "Low",
+            "reasoning": "The article content exceeds the maximum allowed size.",
+            "key_points": []
+        }), 413
+
+    def build_result(text_json, ai_model_label):
+        json_match = re.search(r'\{.*\}', text_json, re.DOTALL)
+        if not json_match:
+            return None
+        result = json.loads(json_match.group())
+        result["source"] = "Groq AI"
+        result["ai_model"] = ai_model_label
+        result["deep_analyzed"] = deep
+        if tavily_answer:
+            result["tavily_summary"] = tavily_answer
+        if article_source:
+            update_source_credibility(article_source, result.get("verdict", "Unverified"))
+        ai_scores = {"True": 0.9, "Misleading": 0.4, "False": 0.1, "Unverified": 0.3}
+        result["trust_score"] = round(ai_scores.get(result.get("verdict", "Unverified"), 0.3), 2)
+        return result
+
+    try:
+        results = []
+
+        if has_groq:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 800
+            }
+            response, used_key = groq_request(payload, api_keys, timeout=2000)
+            if response is not None and response.status_code == 200:
+                data = response.json()
+                if data.get("choices") and len(data["choices"]) > 0:
+                    candidate = data["choices"][0]
+                    if candidate.get("message") and candidate["message"].get("content"):
+                        text = candidate["message"]["content"]
+                        parsed = build_result(text, "groq")
+                        if parsed:
+                            if data.get("citations"):
+                                for c in data["citations"]:
+                                    grounding_sources.append({"title": c.get("title", ""), "uri": c.get("url", ""), "source": "groq"})
+                            if grounding_sources:
+                                parsed["grounding_sources"] = grounding_sources
+                            for h in ["x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]:
+                                if h in response.headers:
+                                    parsed[h.replace("-", "_")] = response.headers[h]
+                            results.append(parsed)
+
+        ollama_text, ollama_model = ollama_request(prompt, format_json=True)
+        if ollama_text:
+            parsed = build_result(ollama_text, ollama_model or "ollama/qwen2.5:0.5b")
+            if parsed:
+                if grounding_sources:
+                    parsed["grounding_sources"] = grounding_sources
+                results.append(parsed)
+
+        if not results:
+            return jsonify({
+                "error": "All AI models failed to generate a valid response.",
+                "error_type": "all_models_failed",
+                "verdict": "Unverified",
+                "confidence": "Low",
+                "reasoning": "No AI model could analyze this article.",
+                "key_points": []
+            }), 500
+
+        response_data = {
+            "results": results,
+            "article_source": article_source,
+            "source_credibility_score": get_source_credibility(article_source) if article_source else None
+        }
+        if results:
+            top = results[0]
+            for key in ["verdict", "confidence", "reasoning", "key_points", "sentiment", "trust_score", "ai_model", "deep_analyzed", "grounding_sources", "tavily_summary", "source"]:
+                if key in top:
+                    response_data[key] = top[key]
+        set_cache(cache_key, response_data)
+        return jsonify(response_data)
+    except requests.exceptions.Timeout:
+        return jsonify({
+            "error": "AI request timed out. Please try again.",
+            "error_type": "timeout",
+            "verdict": "Unverified",
+            "confidence": "Low",
+            "reasoning": "The AI service did not respond in time.",
+            "key_points": []
+        }), 504
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            "error": "Unable to connect to AI service. Check your internet connection.",
+            "error_type": "connection_error",
+            "verdict": "Unverified",
+            "confidence": "Low",
+            "reasoning": "Network connection to the AI service failed.",
+            "key_points": []
+        }), 503
+    except json.JSONDecodeError:
+        return jsonify({
+            "error": "Failed to parse AI response as JSON.",
+            "error_type": "parse_error",
+            "verdict": "Unverified",
+            "confidence": "Low",
+            "reasoning": "The AI response format was invalid.",
+            "key_points": []
+        }), 500
+    except Exception as e:
+        error_str = str(e)
+        error_type = "unknown"
+        if "quota" in error_str.lower():
+            error_type = "quota_exceeded"
+        elif "blocked" in error_str.lower():
+            error_type = "content_blocked"
+        return jsonify({
+            "error": f"Verification failed: {error_str}",
+            "error_type": error_type,
+            "verdict": "Unverified",
+            "confidence": "Low",
+            "reasoning": "An unexpected error occurred during analysis.",
+            "key_points": []
+        }), 500
 
 @app.route("/api/summarize", methods=["POST"])
 @require_auth
@@ -1473,21 +1663,58 @@ def summarize_article(user):
     title = data.get("title", "")
     description = data.get("description", "")
     api_keys = data.get("api_keys") or [data.get("api_key", "")]
+    if not ensure_list(api_keys) and user:
+        db_keys = _get_user_api_keys(user, 'groq')
+        api_keys = ensure_list(db_keys.get('groq', []))
+    lang = data.get("lang", "en")
 
     if not title:
         return jsonify({"error": "title required"}), 400
 
-    cache_key = get_cache_key({"summarize": title})
+    has_groq = bool(ensure_list(api_keys))
+
+    cache_key = get_cache_key({"summarize": title, "lang": lang})
     cached = get_cached(cache_key)
     if cached:
         return jsonify({"summary": cached["summary"], "cached": True, "ai_model": cached.get("ai_model", "")})
 
-    summary = title[:200]
-    if description:
-        summary += ". " + description[:300]
+    language_names = {"en": "English", "hi": "Hindi", "mr": "Marathi"}
+    response_lang = language_names.get(lang, "English")
 
-    set_cache(cache_key, {"summary": summary, "ai_model": "ollama"})
-    return jsonify({"summary": summary, "cached": False, "ai_model": "ollama"})
+    prompt = f"""Summarize the following news article in {response_lang}. Provide a concise summary of 3-5 sentences that captures only the most important information. Write ONLY the summary, no labels or formatting.
+
+Title: {title[:200]}
+Description: {description[:500]}"""
+
+    text = ""
+    ai_model = ""
+    if has_groq:
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 300
+        }
+        response, used_key = groq_request(payload, api_keys, timeout=150)
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            ai_model = "groq"
+
+    if not text:
+        ollama_text, ollama_model = ollama_request(prompt)
+        if ollama_text:
+            text = ollama_text.strip()
+            ai_model = ollama_model
+
+    if not text:
+        fallback = title[:200]
+        if description:
+            fallback += ". " + description[:300]
+        return jsonify({"summary": fallback, "cached": False, "fallback": True})
+
+    set_cache(cache_key, {"summary": text, "ai_model": ai_model})
+    return jsonify({"summary": text, "cached": False, "ai_model": ai_model})
 
 @app.route("/api/translate", methods=["POST"])
 @require_auth
@@ -1495,18 +1722,60 @@ def translate_article(user):
     data = request.json
     text = data.get("text", "")
     target_lang = data.get("target_lang", "en")
+    source_lang = data.get("source_lang", "")
+    api_keys = data.get("api_keys") or []
+    if not ensure_list(api_keys) and user:
+        db_keys = _get_user_api_keys(user, 'groq')
+        api_keys = ensure_list(db_keys.get('groq', []))
 
     if not text:
         return jsonify({"error": "text required"}), 400
+
+    has_groq = bool(ensure_list(api_keys))
+
+    language_names = {"en": "English", "hi": "Hindi", "mr": "Marathi"}
+    target_name = language_names.get(target_lang, "English")
+    source_hint = f" from {language_names.get(source_lang, 'the original language')}" if source_lang else ""
 
     cache_key = get_cache_key({"translate": text[:100], "to": target_lang})
     cached = get_cached(cache_key)
     if cached:
         return jsonify({"translation": cached["translation"], "cached": True, "ai_model": cached.get("ai_model", "")})
 
-    translation = text[:500]
-    set_cache(cache_key, {"translation": translation, "ai_model": "ollama"})
-    return jsonify({"translation": translation, "cached": False, "ai_model": "ollama"})
+    prompt = f"""Translate the following news article text{source_hint} to {target_name}. 
+Preserve the journalistic tone, factual accuracy, and formatting of the original. 
+Keep any proper names, dates, and numbers unchanged.
+Respond with ONLY the translated text, no labels or explanations.
+
+Text to translate:
+{text[:1000]}"""
+
+    translated = ""
+    ai_model = ""
+    if has_groq:
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 1200
+        }
+        response, used_key = groq_request(payload, api_keys, timeout=2000)
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            translated = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            ai_model = "groq"
+
+    if not translated:
+        ollama_text, ollama_model = ollama_request(prompt)
+        if ollama_text:
+            translated = ollama_text.strip()
+            ai_model = ollama_model
+
+    if not translated:
+        translated = text[:500]
+
+    set_cache(cache_key, {"translation": translated, "ai_model": ai_model})
+    return jsonify({"translation": translated, "cached": False, "ai_model": ai_model})
 
 @app.route("/api/chat", methods=["POST"])
 @require_auth
@@ -1515,19 +1784,270 @@ def chat_discussion(user):
     user_message = data.get("message", "")
     history = data.get("history", [])
     article = data.get("article", {})
+    api_keys = data.get("api_keys") or [data.get("api_key", "")]
+    stream = data.get("stream", False)
+
+    if not ensure_list(api_keys) and user:
+        db_keys = _get_user_api_keys(user, 'groq')
+        api_keys = ensure_list(db_keys.get('groq', []))
 
     if not user_message:
         return jsonify({"error": "message required"}), 400
 
-    system_prompt = "You are an objective news discussion assistant helping readers analyze this article."
+    has_groq = bool(ensure_list(api_keys))
 
-    return jsonify({
-        "response": "Chat endpoint in consolidated mode.",
-        "citations": [],
-        "tavily_citations": [],
-        "follow_ups": [],
-        "ai_model": "ollama"
-    })
+    is_first_message = len(history) == 0
+    needs_search = bool(os.getenv('TAVILY_API_KEY', '')) and needs_web_search(user_message)
+
+    tavily_future = None
+    if needs_search:
+        tavily_future = _EXECUTOR.submit(search_tavily, user_message)
+
+    article_context = ""
+    if is_first_message and article.get("title"):
+        article_context += f"Title: {article['title'][:100]}\n"
+    if is_first_message and article.get("description"):
+        article_context += f"Description: {article['description'][:200]}\n"
+
+    compressed_history = list(history)
+    if len(history) > 6 and has_groq:
+        try:
+            summary = summarize_history(history[:-3], api_keys)
+            if summary:
+                compressed_history = [{"role": "system", "text": f"Previous conversation summary: {summary}"}] + history[-3:]
+        except Exception:
+            compressed_history = history[-4:]
+    elif len(history) > 6:
+        compressed_history = history[-4:]
+
+    tavily_snippets = ""
+    tavily_citations = []
+    if tavily_future:
+        try:
+            sources, answer, content = tavily_future.result(timeout=2000)
+            tavily_citations = [{"title": s["title"], "url": s["uri"], "source": "tavily"} for s in sources]
+            if content:
+                tavily_snippets = content
+        except Exception:
+            pass
+
+    system_prompt = "You are an objective news discussion assistant helping readers analyze this article.\n\n"
+    if article_context:
+        system_prompt += f"{article_context}\n"
+    system_prompt += (
+        "Guidelines:\n"
+        "- Be analytical, cite facts from the article when relevant\n"
+        "- Point out potential bias, missing context, or questionable claims\n"
+        "- Ask thought-provoking questions to encourage critical thinking\n"
+        "- Stay neutral and avoid taking political sides\n"
+        "- Keep responses concise (2-4 short paragraphs)\n"
+        "- Respond in the same language the user writes in\n"
+        "- If the article seems misleading, explain why specifically\n"
+        "- Use clear, accessible language\n"
+        "- IMPORTANT: End your response by suggesting exactly 3 follow-up questions. Put each on its own line starting with '\u2192 '"
+    )
+
+    contents = [{"role": "system", "content": system_prompt[:800]}]
+
+    for msg in compressed_history[-4:]:
+        role = "assistant" if msg.get("role") == "ai" else "user"
+        contents.append({"role": role, "content": (msg.get("text") or "")[:500]})
+
+    user_content = user_message[:500]
+    if tavily_snippets:
+        user_content = f"Question: {user_message[:300]}\n\nRelevant web search results:\n{tavily_snippets}"[:1000]
+
+    contents.append({"role": "user", "content": user_content})
+
+    total_chars = sum(len(m.get("content", "")) for m in contents)
+    if total_chars > 4000:
+        return jsonify({
+            "error": "Conversation is too long. Please start a new chat.",
+            "error_type": "too_large"
+        }), 413
+
+    def build_ollama_prompt():
+        parts = []
+        for m in contents:
+            role = m["role"]
+            content = m["content"]
+            if role == "system":
+                parts.append(f"System: {content}")
+            elif role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+        parts.append("Assistant:")
+        return "\n\n".join(parts)
+
+    try:
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": contents,
+            "temperature": 0.4,
+            "max_tokens": 800,
+        }
+
+        if stream and has_groq:
+            payload["stream"] = True
+            resp, used_key = None, None
+            for key in ensure_list(api_keys):
+                if not key:
+                    continue
+                try:
+                    r = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        stream=True, timeout=3000
+                    )
+                    if r.status_code in (401, 403, 429):
+                        continue
+                    resp = r
+                    break
+                except Exception:
+                    continue
+
+            if resp is None:
+                ollama_prompt = build_ollama_prompt()
+                ollama_text, ollama_model = ollama_request(ollama_prompt, system_prompt=system_prompt[:800])
+                if ollama_text:
+                    follow_ups = []
+                    clean_lines = []
+                    for line_text in ollama_text.split("\n"):
+                        if line_text.startswith("\u2192 "):
+                            follow_ups.append(line_text[2:].strip())
+                        else:
+                            clean_lines.append(line_text)
+                    clean_text = "\n".join(clean_lines).strip()
+
+                    def generate_ollama():
+                        yield f"data: {json.dumps({'type': 'token', 'content': clean_text})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'citations': [], 'tavily_citations': tavily_citations, 'follow_ups': follow_ups, 'ai_model': ollama_model})}\n\n"
+
+                    return Response(generate_ollama(), mimetype='text/event-stream')
+                return jsonify({"error": "All API keys exhausted", "error_type": "auth_error"}), 401
+
+            def generate():
+                if resp.status_code != 200:
+                    err_text = "AI request failed"
+                    try:
+                        err_text = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        err_text = resp.text[:200]
+                    yield f"data: {json.dumps({'type': 'error', 'error': err_text})}\n\n"
+                    return
+
+                full_text = ""
+                for line in resp.iter_lines():
+                    if line:
+                        decoded = line.decode('utf-8')
+                        if decoded.startswith('data: '):
+                            data_str = decoded[6:]
+                            if data_str == '[DONE]':
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                                token = delta.get('content', '')
+                                if token:
+                                    full_text += token
+                                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+
+                follow_ups = []
+                clean_lines = []
+                for line_text in full_text.split("\n"):
+                    if line_text.startswith("\u2192 "):
+                        follow_ups.append(line_text[2:].strip())
+                    else:
+                        clean_lines.append(line_text)
+
+                yield f"data: {json.dumps({'type': 'done', 'citations': [], 'tavily_citations': tavily_citations, 'follow_ups': follow_ups, 'ai_model': 'groq'})}\n\n"
+
+            return Response(generate(), mimetype='text/event-stream')
+
+        if not has_groq:
+            resp = None
+        else:
+            resp, used_key = groq_request(payload, api_keys, timeout=3000)
+
+        if resp is None:
+            ollama_prompt = build_ollama_prompt()
+            ollama_text, ollama_model = ollama_request(ollama_prompt, system_prompt=system_prompt[:800])
+            if ollama_text:
+                follow_ups = []
+                clean_lines = []
+                for line_text in ollama_text.split("\n"):
+                    if line_text.startswith("\u2192 "):
+                        follow_ups.append(line_text[2:].strip())
+                    else:
+                        clean_lines.append(line_text)
+                clean_text = "\n".join(clean_lines).strip()
+                return jsonify({
+                    "response": clean_text,
+                    "citations": [],
+                    "tavily_citations": tavily_citations,
+                    "follow_ups": follow_ups,
+                    "ai_model": ollama_model
+                })
+            return jsonify({"error": "All API keys exhausted", "error_type": "auth_error"}), 401
+
+        if resp.status_code == 413:
+            return jsonify({"error": "Message is too long. Try a shorter question or start a new conversation.", "error_type": "too_large"}), 413
+        if resp.status_code == 400:
+            return jsonify({"error": "AI couldn't understand that. Try rephrasing.", "error_type": "bad_request"}), 400
+        if resp.status_code == 500:
+            return jsonify({"error": "AI service encountered an internal error. Try again shortly.", "error_type": "server_error"}), 500
+        if resp.status_code == 503:
+            retry = resp.headers.get('Retry-After', 0)
+            try:
+                retry = int(retry) if retry else 0
+            except (ValueError, TypeError):
+                retry = 0
+            return jsonify({"error": "AI service is temporarily unavailable.", "error_type": "service_unavailable", "retry_after": retry}), 503
+        if resp.status_code != 200:
+            err_detail = "Unknown error"
+            try:
+                err_detail = resp.json().get("error", {}).get("message", str(resp.status_code))
+            except Exception:
+                err_detail = resp.text[:200]
+            return jsonify({"error": f"Unexpected AI error: {err_detail}", "error_type": "unexpected"}), resp.status_code
+
+        result = resp.json()
+        if not result.get("choices"):
+            return jsonify({"error": "No response from AI", "error_type": "no_response"}), 500
+
+        text = result["choices"][0].get("message", {}).get("content", "")
+        if not text:
+            return jsonify({"error": "Empty response from AI", "error_type": "empty_response"}), 500
+
+        follow_ups = []
+        clean_lines = []
+        for line_text in text.split("\n"):
+            if line_text.startswith("\u2192 "):
+                follow_ups.append(line_text[2:].strip())
+            else:
+                clean_lines.append(line_text)
+        clean_text = "\n".join(clean_lines).strip()
+
+        all_citations = (result.get("citations") or []) + tavily_citations
+
+        return jsonify({
+            "response": clean_text,
+            "citations": all_citations,
+            "tavily_citations": tavily_citations,
+            "follow_ups": follow_ups,
+            "ai_model": "groq"
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "AI took too long. Try a shorter question.", "error_type": "timeout"}), 504
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Unable to connect. Check your internet connection.", "error_type": "network_error"}), 503
+    except Exception as e:
+        return jsonify({"error": f"Chat error: {str(e)}", "error_type": "unexpected"}), 500
 
 @app.route("/api/test-api-key", methods=["POST"])
 @require_auth
