@@ -51,7 +51,7 @@ if os.path.exists(_CA_PATH) and 'sslmode=require' in _DATABASE_URL:
     _DATABASE_URL = _DATABASE_URL.replace('sslmode=require', f'sslmode=verify-ca&sslrootcert={_CA_PATH}')
 
 # Server Configuration Constants
-OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'https://ollama-production-eaed.up.railway.app')
 GEMINI_URL = os.getenv('GEMINI_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent')
 GROQ_URL = os.getenv('GROQ_URL', 'https://api.groq.com/openai/v1/chat/completions')
 
@@ -565,7 +565,7 @@ def call_ollama_topic_expand(prompt):
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/generate",
-            json={"model": "phi3:mini", "prompt": prompt, "stream": False, "format": "json"},
+            json={"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False, "format": "json"},
             timeout=120
         )
         if resp.status_code == 200:
@@ -792,7 +792,7 @@ def groq_request(payload, api_keys, timeout=2000):
 
 def ollama_request(prompt, system_prompt=None, format_json=False, timeout=120):
     try:
-        payload = {"model": "phi3:mini", "prompt": prompt, "stream": False}
+        payload = {"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False}
         if system_prompt:
             payload["system"] = system_prompt
         if format_json:
@@ -806,7 +806,7 @@ def ollama_request(prompt, system_prompt=None, format_json=False, timeout=120):
             data = resp.json()
             text = data.get("response", "").strip()
             if text:
-                return text, "ollama/phi3:mini"
+                return text, "ollama/qwen2.5:0.5b"
     except Exception as e:
         logger.warning(f"Ollama request error: {e}")
     return None, None
