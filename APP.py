@@ -36,7 +36,7 @@ import py_compile
 import getpass
 from collections import Counter
 from dotenv import load_dotenv
-from news_sources import rss_feeds
+
 from sqlalchemy import inspect, Table, Column, Integer, String, LargeBinary, DateTime, MetaData
 
 # ============================================================================
@@ -704,11 +704,8 @@ def cluster_articles(articles, threshold=0.7):
     return clusters
 
 def _get_fetch_tasks(query, category, language, country):
-    # Import news sources (these would be from news_sources module)
-    # For this consolidated version, we're leaving placeholder imports
+    # RSS and news source fetching is handled inline in this file
     tasks = []
-    # Add tasks from various news sources
-    # These would need the actual implementations from news_sources package
     return tasks
 
 def fetch_all_sources(query=None, category=None, source_filter=None, language=None, country=None, sort=None, custom_rss_sources=None, blocked_sources=None):
@@ -857,6 +854,144 @@ def needs_web_search(message):
     if len(msg) < 10:
         return False
     return any(kw in msg for kw in keywords)
+
+# ============================================================================
+# RSS FEED HELPERS
+# ============================================================================
+
+import feedparser
+
+RSS_FEEDS = {
+    "bbc": "http://feeds.bbci.co.uk/news/rss.xml",
+    "bbc_world": "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "reuters": "https://www.rss.reuters.com/news/arc/rss/topnews",
+    "reuters_world": "https://www.rss.reuters.com/news/arc/rss/world",
+    "the_hindu": "https://www.thehindu.com/news/national/feeder/default.rss",
+    "the_hindu_latest": "https://www.thehindu.com/news/feeder/default.rss",
+    "amar_ujala": "https://www.amarujala.com/rss/india-news.xml",
+    "aaj_tak": "https://aajtak.intoday.in/rss",
+    "pudhari": "https://www.pudhari.news/feed/",
+}
+
+def fetch_rss(source="bbc", max_items=30, timeout=6):
+    urls = []
+    if source == "bbc":
+        urls = [RSS_FEEDS["bbc"], RSS_FEEDS["bbc_world"]]
+    elif source == "reuters":
+        urls = [RSS_FEEDS["reuters"], RSS_FEEDS["reuters_world"]]
+    elif source == "the_hindu":
+        urls = [RSS_FEEDS["the_hindu"], RSS_FEEDS["the_hindu_latest"]]
+    else:
+        url = RSS_FEEDS.get(source)
+        if url:
+            urls = [url]
+        else:
+            return []
+    articles = []
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            for entry in feed.entries[:max_items]:
+                image = ""
+                if entry.get("media_content"):
+                    image = entry.media_content[0].get("url", "")
+                elif entry.get("media_thumbnail"):
+                    image = entry.media_thumbnail[0].get("url", "")
+                elif entry.get("summary"):
+                    match = re.search(r'<img[^>]+src="([^"]+)"', entry.summary)
+                    if match:
+                        image = match.group(1)
+                articles.append({
+                    "title": entry.get("title") or "",
+                    "description": entry.get("summary") or entry.get("description") or "",
+                    "url": entry.get("link") or "",
+                    "source": feed.feed.get("title") or source,
+                    "image": image,
+                    "published_at": entry.get("published") or entry.get("pubDate") or "",
+                    "author": entry.get("author") or "",
+                    "api_source": f"rss_{source}",
+                })
+        except Exception as e:
+            print(f"RSS feed error ({source}, {url}): {e}")
+    return articles
+
+def fetch_all_rss(max_per_source=30):
+    all_articles = []
+    for source in ["bbc", "reuters", "the_hindu"]:
+        all_articles.extend(fetch_rss(source, max_per_source))
+    return all_articles
+
+def fetch_custom_rss(url, max_items=20, timeout=8):
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+        articles = []
+        for entry in feed.entries[:max_items]:
+            image = ""
+            if entry.get("media_content"):
+                image = entry.media_content[0].get("url", "")
+            elif entry.get("media_thumbnail"):
+                image = entry.media_thumbnail[0].get("url", "")
+            elif entry.get("summary"):
+                match = re.search(r'<img[^>]+src="([^"]+)"', entry.summary)
+                if match:
+                    image = match.group(1)
+            articles.append({
+                "title": entry.get("title") or "",
+                "description": entry.get("summary") or entry.get("description") or "",
+                "url": entry.get("link") or "",
+                "source": feed.feed.get("title") or "Custom RSS",
+                "image": image,
+                "published_at": entry.get("published") or entry.get("pubDate") or "",
+                "author": entry.get("author") or "",
+                "api_source": "custom_rss",
+            })
+        return articles
+    except Exception as e:
+        print(f"Custom RSS fetch error ({url}): {e}")
+        return []
+
+def fetch_google_news(query="india news", max_items=30, lang="en", timeout=6):
+    from urllib.parse import quote
+    locale_map = {"en": "en-IN", "hi": "hi-IN", "mr": "mr-IN"}
+    hl = locale_map.get(lang, "en-IN")
+    lang_code = hl.split("-")[0]
+    url = f"https://news.google.com/rss/search?q={quote(query)}&hl={hl}&gl=IN&ceid=IN:{lang_code}"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+        articles = []
+        for entry in feed.entries[:max_items]:
+            title = entry.get("title", "")
+            if " - " in title:
+                title = title.rsplit(" - ", 1)[0]
+            source_name = "Google News"
+            if entry.get("source") and entry.source.get("title"):
+                source_name = entry.source.title
+            image = ""
+            summary = entry.get("summary") or ""
+            match = re.search(r'<img[^>]+src="([^"]+)"', summary)
+            if match:
+                image = match.group(1)
+            articles.append({
+                "title": title,
+                "description": re.sub(r"<[^>]+>", "", summary)[:200],
+                "url": entry.get("link") or "",
+                "source": source_name,
+                "image": image,
+                "published_at": entry.get("published") or entry.get("pubDate") or "",
+                "author": "",
+                "api_source": "google_news",
+            })
+        return articles
+    except Exception as e:
+        print(f"Google News RSS error: {e}")
+        return []
+
 
 def summarize_history(history, api_keys):
     text = "\n".join(f"{m.get('role', 'user')}: {m.get('text', '')[:200]}" for m in history)
@@ -2003,7 +2138,7 @@ def add_custom_rss(user):
     existing = CustomRssSource.query.filter_by(user_id=user.id, url=url).first()
     if existing:
         return jsonify({"error": "Source already added"}), 400
-    test = rss_feeds.fetch_custom_rss(url, max_items=1)
+    test = fetch_custom_rss(url, max_items=1)
     if not test:
         return jsonify({"error": "Could not fetch RSS feed from this URL"}), 400
     source = CustomRssSource(user_id=user.id, url=url, label=label or test[0].get("source", "Custom RSS"))
