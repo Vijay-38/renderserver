@@ -2626,7 +2626,7 @@ def cricapi_scorecard(match_id):
 @require_auth
 def track_reading(user):
     if not user:
-        return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"status": "ok"})
     data = request.get_json()
     if not data or not data.get("url"):
         return jsonify({"error": "url required"}), 400
