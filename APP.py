@@ -57,7 +57,7 @@ GROQ_URL = os.getenv('GROQ_URL', 'https://api.groq.com/openai/v1/chat/completion
 
 # Cache and timing constants
 CACHE_TTL = 300
-NEWS_FETCH_TIMEOUT = None
+NEWS_FETCH_TIMEOUT = 15
 DAILY_LIMIT = 20
 
 # ============================================================================
@@ -700,21 +700,40 @@ def cluster_articles(articles, threshold=0.7):
     return clusters
 
 def _get_fetch_tasks(query, category, language, country):
-    # RSS and news source fetching is handled inline in this file
     tasks = []
+    tasks.append(("newsdata", lambda: newsdata_fetch_latest(query=query, language=language)))
+    tasks.append(("gnews", lambda: gnews_fetch_search(query=query, lang=language) if query else gnews_fetch_top_headlines(lang=language, country=country or 'us', category=category)))
+    if language == 'en':
+        tasks.append(("currents", lambda: currents_fetch_search(keywords=query, country=country) if query else currents_fetch_latest(category=category, country=country)))
+        tasks.append(("newsapi", lambda: newsapi_fetch_everything(query=query) if query else newsapi_fetch_top_headlines(country=country or 'us', category=category)))
+    if not country or country == 'in':
+        tasks.append(("google_news", lambda: fetch_google_news(query if query else 'india news', lang=language)))
+    if not country or country in ('in', 'gb', 'us'):
+        if language == 'en':
+            tasks.append(("rss_bbc", lambda: fetch_rss("bbc")))
+            tasks.append(("rss_reuters", lambda: fetch_rss("reuters")))
+            tasks.append(("rss_the_hindu", lambda: fetch_rss("the_hindu")))
+        elif language == 'hi':
+            tasks.append(("rss_amar_ujala", lambda: fetch_rss("amar_ujala")))
+            tasks.append(("rss_aaj_tak", lambda: fetch_rss("aaj_tak")))
+        elif language == 'mr':
+            tasks.append(("rss_pudhari", lambda: fetch_rss("pudhari")))
     return tasks
 
 def fetch_all_sources(query=None, category=None, source_filter=None, language=None, country=None, sort=None, custom_rss_sources=None, blocked_sources=None):
-    articles = []
-    failed_sources = []
-    search_terms = []
-    
-    # This is a placeholder for the actual news fetching logic
-    # In production, this would fetch from multiple news sources using ThreadPoolExecutor
-    
     requested = None
     if source_filter:
         requested = set(s.strip().lower() for s in source_filter.split(","))
+
+    tasks = _get_fetch_tasks(query, category, language or 'en', country)
+    if custom_rss_sources:
+        for rss in custom_rss_sources:
+            label = rss.get('label', '')
+            url = rss.get('url', '')
+            if url:
+                tasks.append((f"custom_rss_{label or url}", lambda u=url: fetch_custom_rss(u)))
+    if requested:
+        tasks = [(src, fn) for src, fn in tasks if any(r in src for r in requested)]
 
     blocked = set()
     if blocked_sources:
@@ -725,6 +744,45 @@ def fetch_all_sources(query=None, category=None, source_filter=None, language=No
                 blocked = set(blocked_sources.split(','))
         elif isinstance(blocked_sources, list):
             blocked = set(s.lower().strip() for s in blocked_sources)
+
+    articles = []
+    failed_sources = []
+    futures = {_EXECUTOR.submit(fn): src for src, fn in tasks}
+    deadline = time.time() + NEWS_FETCH_TIMEOUT
+    completed = set()
+
+    try:
+        for future in as_completed(futures, timeout=NEWS_FETCH_TIMEOUT):
+            src = futures[future]
+            completed.add(future)
+            try:
+                remaining = max(0.01, deadline - time.time())
+                result = future.result(timeout=remaining)
+                articles.extend(result)
+            except Exception as e:
+                logger.warning(f"Source error ({src}): {e}")
+                failed_sources.append({"source": src, "error": str(e)})
+                record_source_error(src, e)
+            if time.time() >= deadline:
+                break
+    except TimeoutError:
+        logger.warning(f"News fetch timeout reached after {NEWS_FETCH_TIMEOUT}s; returning partial results.")
+
+    for future, src in futures.items():
+        if future in completed:
+            continue
+        if future.done():
+            try:
+                result = future.result()
+                articles.extend(result)
+            except Exception as e:
+                logger.warning(f"Source error ({src}) after timeout: {e}")
+                failed_sources.append({"source": src, "error": str(e)})
+                record_source_error(src, e)
+        else:
+            logger.warning(f"Source timeout ({src}) after {NEWS_FETCH_TIMEOUT}s")
+            failed_sources.append({"source": src, "error": "timeout"})
+            future.cancel()
 
     EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
     def parse_date(d):
@@ -747,6 +805,7 @@ def fetch_all_sources(query=None, category=None, source_filter=None, language=No
     for a in unique:
         a["source_score"] = get_source_credibility(a.get("source", ""))
 
+    search_terms = []
     if query:
         unique, search_terms = score_and_filter_articles(unique, query)
     elif sort == "newest":
@@ -850,6 +909,262 @@ def needs_web_search(message):
     if len(msg) < 10:
         return False
     return any(kw in msg for kw in keywords)
+
+# ============================================================================
+# NEWS API SOURCE WRAPPERS (NewsData, GNews, NewsAPI, Currents)
+# These are inlined here so server.py is fully self-contained.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# NewsData.io wrapper
+# ---------------------------------------------------------------------------
+NEWSDATA_API_KEYS = [
+    "pub_cd613a9c02214a90b2996680881099e5",
+    "pub_214cf48a21ed4135be32aa2095be738d",
+    "pub_000153f0ca454e3c9cc2e1b400e42589",
+    "pub_e34e861b8b6f4d909d5f4262ae1895a3",
+]
+_newsdata_key_idx = 0
+NEWSDATA_BASE = "https://newsdata.io/api/1"
+
+def _newsdata_key():
+    global _newsdata_key_idx
+    return NEWSDATA_API_KEYS[_newsdata_key_idx]
+
+def _newsdata_rotate():
+    global _newsdata_key_idx
+    _newsdata_key_idx = (_newsdata_key_idx + 1) % len(NEWSDATA_API_KEYS)
+    logger.info(f"NewsData: rotating to key[{_newsdata_key_idx}]")
+
+def newsdata_fetch_latest(country=None, category=None, query=None, language="en", size=20):
+    for attempt in range(len(NEWSDATA_API_KEYS)):
+        params = {"apikey": _newsdata_key(), "language": language}
+        if country: params["country"] = country
+        if category: params["category"] = category
+        if query: params["q"] = query
+        try:
+            resp = requests.get(f"{NEWSDATA_BASE}/latest", params=params, timeout=None)
+            resp.raise_for_status()
+            data = resp.json()
+            articles = []
+            for a in data.get("results", [])[:size]:
+                articles.append({
+                    "title": a.get("title") or "",
+                    "description": a.get("description") or "",
+                    "url": a.get("link") or "",
+                    "source": a.get("source_name") or "NewsData",
+                    "image": a.get("image_url") or "",
+                    "published_at": a.get("pubDate") or "",
+                    "author": a.get("creator")[0] if a.get("creator") else "",
+                    "api_source": "newsdata",
+                })
+            return articles
+        except Exception as e:
+            logger.warning(f"NewsData error (key[{_newsdata_key_idx}]): {e}")
+            _newsdata_rotate()
+    logger.warning("NewsData: all keys exhausted")
+    return []
+
+# ---------------------------------------------------------------------------
+# GNews wrapper
+# ---------------------------------------------------------------------------
+GNEWS_API_KEY = "8b15af7238d33df2a4e695d7d3b4b471"
+GNEWS_BASE = "https://gnews.io/api/v4"
+_gnews_last_429 = 0
+_GNEWS_COOLDOWN = 86400
+
+def _gnews_on_cooldown():
+    global _gnews_last_429
+    if not _gnews_last_429:
+        return False
+    elapsed = time.time() - _gnews_last_429
+    if elapsed < _GNEWS_COOLDOWN:
+        logger.info(f"GNews: skipping (rate-limited {elapsed/60:.0f}m ago)")
+        return True
+    _gnews_last_429 = 0
+    return False
+
+def _gnews_request(url, params):
+    global _gnews_last_429
+    resp = requests.get(url, params=params, timeout=None)
+    if resp.status_code == 429:
+        _gnews_last_429 = time.time()
+        raise Exception("429 Too Many Requests — rate-limited")
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("errors"):
+        raise Exception(f"API error: {data['errors']}")
+    return data
+
+def _gnews_parse(data):
+    articles = []
+    for a in data.get("articles", []):
+        articles.append({
+            "title": a.get("title") or "",
+            "description": a.get("description") or "",
+            "url": a.get("url") or "",
+            "source": a.get("source", {}).get("name") or "GNews",
+            "image": a.get("image") or "",
+            "published_at": a.get("publishedAt") or "",
+            "author": a.get("source", {}).get("url") or "",
+            "api_source": "gnews",
+        })
+    return articles
+
+def gnews_fetch_top_headlines(lang="en", country="us", category=None, max_results=15):
+    if _gnews_on_cooldown():
+        return []
+    try:
+        params = {"token": GNEWS_API_KEY, "lang": lang, "country": country, "max": max_results}
+        if category: params["category"] = category
+        data = _gnews_request(f"{GNEWS_BASE}/top-headlines", params)
+        return _gnews_parse(data)
+    except Exception as e:
+        logger.warning(f"GNews top-headlines error: {e}")
+        raise
+
+def gnews_fetch_search(query, lang="en", max_results=15):
+    if _gnews_on_cooldown():
+        return []
+    try:
+        params = {"token": GNEWS_API_KEY, "q": query, "lang": lang, "max": max_results}
+        data = _gnews_request(f"{GNEWS_BASE}/search", params)
+        return _gnews_parse(data)
+    except Exception as e:
+        logger.warning(f"GNews search error: {e}")
+        raise
+
+# ---------------------------------------------------------------------------
+# NewsAPI wrapper
+# ---------------------------------------------------------------------------
+NEWSAPI_KEYS = [
+    "8a5b1956773b4281a1f19d4bbf1814f8",
+    "cb640b61624743feb65fb8d4fb59421a",
+    "8ff5f08341d54b258dc81f2122ed5d8e",
+    "25540b08a90a4a3ebebd0671b3aaad06",
+]
+_newsapi_key_idx = 0
+NEWSAPI_BASE = "https://newsapi.org/v2"
+
+def _newsapi_key():
+    global _newsapi_key_idx
+    return NEWSAPI_KEYS[_newsapi_key_idx]
+
+def _newsapi_rotate():
+    global _newsapi_key_idx
+    _newsapi_key_idx = (_newsapi_key_idx + 1) % len(NEWSAPI_KEYS)
+    logger.info(f"NewsAPI: rotating to key[{_newsapi_key_idx}]")
+
+def _newsapi_parse(data):
+    articles = []
+    for a in data.get("articles", []):
+        if a.get("title") and a.get("title") != "[Removed]":
+            articles.append({
+                "title": a["title"],
+                "description": a.get("description") or "",
+                "url": a.get("url") or "",
+                "source": a.get("source", {}).get("name") or "NewsAPI",
+                "image": a.get("urlToImage") or "",
+                "published_at": a.get("publishedAt") or "",
+                "author": a.get("author") or "",
+                "api_source": "newsapi",
+            })
+    return articles
+
+def newsapi_fetch_top_headlines(country="us", category=None, query=None, page_size=30):
+    for attempt in range(len(NEWSAPI_KEYS)):
+        params = {"apiKey": _newsapi_key(), "pageSize": page_size}
+        if query: params["q"] = query
+        else: params["country"] = country
+        if category: params["category"] = category
+        try:
+            resp = requests.get(f"{NEWSAPI_BASE}/top-headlines", params=params, timeout=None)
+            resp.raise_for_status()
+            return _newsapi_parse(resp.json())
+        except Exception as e:
+            logger.warning(f"NewsAPI error (key[{_newsapi_key_idx}]): {e}")
+            _newsapi_rotate()
+    logger.warning("NewsAPI: all keys exhausted")
+    return []
+
+def newsapi_fetch_everything(query=None, sort_by="publishedAt", page_size=50):
+    for attempt in range(len(NEWSAPI_KEYS)):
+        params = {"apiKey": _newsapi_key(), "pageSize": page_size, "sortBy": sort_by}
+        if query: params["q"] = query
+        try:
+            resp = requests.get(f"{NEWSAPI_BASE}/everything", params=params, timeout=None)
+            resp.raise_for_status()
+            return _newsapi_parse(resp.json())
+        except Exception as e:
+            logger.warning(f"NewsAPI everything error (key[{_newsapi_key_idx}]): {e}")
+            _newsapi_rotate()
+    logger.warning("NewsAPI: all keys exhausted")
+    return []
+
+# ---------------------------------------------------------------------------
+# Currents API wrapper
+# ---------------------------------------------------------------------------
+CURRENTS_KEYS = [
+    "yV7zQ0szTQCbIQugGyHlcGbCqEmuJJighQcxOApAQzcF3yjM",
+    "HGte8fcaGNFZ1JqXd5WF2C80SSEY3PyMRUlUYEVkCOegEXtH",
+    "soxFk92k8nqVtgTIGVLbQ-kIIbk4ZSF42TjriacIUWdWLex_",
+]
+_currents_key_idx = 0
+CURRENTS_BASE = "https://api.currentsapi.services/v1"
+
+def _currents_key():
+    global _currents_key_idx
+    return CURRENTS_KEYS[_currents_key_idx]
+
+def _currents_rotate():
+    global _currents_key_idx
+    _currents_key_idx = (_currents_key_idx + 1) % len(CURRENTS_KEYS)
+    logger.info(f"Currents: rotating to key[{_currents_key_idx}]")
+
+def _currents_parse(data):
+    articles = []
+    for a in data.get("news", []):
+        articles.append({
+            "title": a.get("title") or "",
+            "description": a.get("description") or "",
+            "url": a.get("url") or "",
+            "source": a.get("name") or "Currents",
+            "image": a.get("image") or "",
+            "published_at": a.get("published") or "",
+            "author": a.get("author") or "",
+            "api_source": "currents",
+        })
+    return articles
+
+def currents_fetch_latest(category=None, country=None, query=None, size=40):
+    for attempt in range(len(CURRENTS_KEYS)):
+        params = {"apiKey": _currents_key(), "count": size}
+        if category: params["category"] = category
+        if country: params["country"] = country
+        if query: params["keywords"] = query
+        try:
+            resp = requests.get(f"{CURRENTS_BASE}/latest-news", params=params, timeout=None)
+            resp.raise_for_status()
+            return _currents_parse(resp.json())
+        except Exception as e:
+            logger.warning(f"Currents error (key[{_currents_key_idx}]): {e}")
+            _currents_rotate()
+    logger.warning("Currents: all keys exhausted")
+    return []
+
+def currents_fetch_search(keywords, country=None, size=40):
+    for attempt in range(len(CURRENTS_KEYS)):
+        params = {"apiKey": _currents_key(), "keywords": keywords, "count": size}
+        if country: params["country"] = country
+        try:
+            resp = requests.get(f"{CURRENTS_BASE}/search", params=params, timeout=None)
+            resp.raise_for_status()
+            return _currents_parse(resp.json())
+        except Exception as e:
+            logger.warning(f"Currents search error (key[{_currents_key_idx}]): {e}")
+            _currents_rotate()
+    logger.warning("Currents: all keys exhausted")
+    return []
 
 # ============================================================================
 # RSS FEED HELPERS
@@ -1235,8 +1550,7 @@ def get_headlines(user):
     country = request.args.get("country", "us")
     category = request.args.get("category")
     limit = int(request.args.get("limit", 20))
-    # Fetch headlines using news API
-    articles = []
+    articles = newsapi_fetch_top_headlines(country=country, category=category, page_size=limit)
     return jsonify({"articles": articles})
 
 @app.route("/api/news/search")
@@ -1251,10 +1565,11 @@ def search_news(user):
     cache_key = get_cache_key({"q": query, "type": "search"})
     cached = get_cached(cache_key)
     if cached:
-        return jsonify({"articles": cached[offset:offset + limit], "total": len(cached), "cached": True})
+        articles = cached.get("articles", [])
+        return jsonify({"articles": articles[offset:offset + limit], "total": len(articles), "cached": True})
 
     articles, _, _ = fetch_all_sources(query=query)
-    set_cache(cache_key, {"articles": articles, "failed_sources": [], "search_terms": []})
+    set_cache(cache_key, {"articles": articles})
     return jsonify({"articles": articles[offset:offset + limit], "total": len(articles), "cached": False})
 
 @app.route("/api/news/sources")
@@ -1262,7 +1577,14 @@ def search_news(user):
 def get_sources(user):
     source = request.args.get("source", "")
     limit = int(request.args.get("limit", 15))
-    articles = []
+    if source == "bbc":
+        articles = fetch_rss("bbc", limit)
+    elif source == "reuters":
+        articles = fetch_rss("reuters", limit)
+    elif source == "the_hindu":
+        articles = fetch_rss("the_hindu", limit)
+    else:
+        articles = fetch_all_rss(limit)
     return jsonify({"articles": articles[:limit], "source": source or "all"})
 
 @app.route("/api/news/clusters")
