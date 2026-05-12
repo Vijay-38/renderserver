@@ -57,7 +57,7 @@ GROQ_URL = os.getenv('GROQ_URL', 'https://api.groq.com/openai/v1/chat/completion
 
 # Cache and timing constants
 CACHE_TTL = 300
-NEWS_FETCH_TIMEOUT = 7
+NEWS_FETCH_TIMEOUT = None
 DAILY_LIMIT = 20
 
 # ============================================================================
@@ -518,7 +518,7 @@ def call_gemini(prompt, api_keys):
             resp = requests.post(
                 f"{GEMINI_URL}?key={key}",
                 json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=15
+                timeout=None
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -546,7 +546,7 @@ def call_groq_compound(prompt, api_keys):
                     "max_tokens": 1000
                 },
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                timeout=200
+                timeout=None
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -566,7 +566,7 @@ def call_ollama_topic_expand(prompt):
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/generate",
             json={"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False, "format": "json"},
-            timeout=120
+            timeout=None
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -765,7 +765,7 @@ def fetch_all_sources(query=None, category=None, source_filter=None, language=No
 # AI REQUEST HELPERS
 # ============================================================================
 
-def groq_request(payload, api_keys, timeout=2000):
+def groq_request(payload, api_keys, timeout=None):
     keys = ensure_list(api_keys)
     if not keys:
         return None, None
@@ -790,7 +790,7 @@ def groq_request(payload, api_keys, timeout=2000):
             continue
     return None, None
 
-def ollama_request(prompt, system_prompt=None, format_json=False, timeout=120):
+def ollama_request(prompt, system_prompt=None, format_json=False, timeout=None):
     try:
         payload = {"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False}
         if system_prompt:
@@ -822,7 +822,7 @@ def search_tavily(query):
             "search_depth": "advanced",
             "include_answer": True,
             "max_results": 5
-        }, timeout=200)
+        }, timeout=None)
         if resp.status_code == 200:
             data = resp.json()
             sources = []
@@ -869,7 +869,7 @@ RSS_FEEDS = {
     "pudhari": "https://www.pudhari.news/feed/",
 }
 
-def fetch_rss(source="bbc", max_items=30, timeout=6):
+def fetch_rss(source="bbc", max_items=30, timeout=None):
     urls = []
     if source == "bbc":
         urls = [RSS_FEEDS["bbc"], RSS_FEEDS["bbc_world"]]
@@ -919,7 +919,7 @@ def fetch_all_rss(max_per_source=30):
         all_articles.extend(fetch_rss(source, max_per_source))
     return all_articles
 
-def fetch_custom_rss(url, max_items=20, timeout=8):
+def fetch_custom_rss(url, max_items=20, timeout=None):
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
@@ -950,7 +950,7 @@ def fetch_custom_rss(url, max_items=20, timeout=8):
         print(f"Custom RSS fetch error ({url}): {e}")
         return []
 
-def fetch_google_news(query="india news", max_items=30, lang="en", timeout=6):
+def fetch_google_news(query="india news", max_items=30, lang="en", timeout=None):
     from urllib.parse import quote
     locale_map = {"en": "en-IN", "hi": "hi-IN", "mr": "mr-IN"}
     hl = locale_map.get(lang, "en-IN")
@@ -999,7 +999,7 @@ def summarize_history(history, api_keys):
                 "messages": [{"role": "user", "content": f"Summarize this conversation in 1-2 sentences:\n\n{text}"}],
                 "max_tokens": 100,
                 "temperature": 0.3
-            }, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, timeout=5)
+            }, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, timeout=None)
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
@@ -1371,7 +1371,7 @@ def fetch_article(user):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9"
         }
-        resp = requests.get(url, headers=headers, timeout=150)
+        resp = requests.get(url, headers=headers, timeout=None)
         if resp.status_code != 200:
             return jsonify({"error": f"Failed to fetch article (HTTP {resp.status_code})"}), resp.status_code
 
@@ -1480,7 +1480,7 @@ def groq_verify_article(user):
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 }
-                resp = requests.get(url, headers=headers, timeout=2000)
+                resp = requests.get(url, headers=headers, timeout=None)
                 if resp.status_code == 200:
                     soup = BeautifulSoup(resp.text, 'html.parser')
                     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
@@ -1564,7 +1564,7 @@ Only respond with valid JSON, nothing else."""
                 "temperature": 0.2,
                 "max_tokens": 800
             }
-            response, used_key = groq_request(payload, api_keys, timeout=2000)
+            response, used_key = groq_request(payload, api_keys, timeout=None)
             if response is not None and response.status_code == 200:
                 data = response.json()
                 if data.get("choices") and len(data["choices"]) > 0:
@@ -1695,7 +1695,7 @@ Description: {description[:500]}"""
             "temperature": 0.3,
             "max_tokens": 300
         }
-        response, used_key = groq_request(payload, api_keys, timeout=150)
+        response, used_key = groq_request(payload, api_keys, timeout=None)
         if response is not None and response.status_code == 200:
             data = response.json()
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -1759,7 +1759,7 @@ Text to translate:
             "temperature": 0.2,
             "max_tokens": 1200
         }
-        response, used_key = groq_request(payload, api_keys, timeout=2000)
+        response, used_key = groq_request(payload, api_keys, timeout=None)
         if response is not None and response.status_code == 200:
             data = response.json()
             translated = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -1824,7 +1824,7 @@ def chat_discussion(user):
     tavily_citations = []
     if tavily_future:
         try:
-            sources, answer, content = tavily_future.result(timeout=2000)
+            sources, answer, content = tavily_future.result()
             tavily_citations = [{"title": s["title"], "url": s["uri"], "source": "tavily"} for s in sources]
             if content:
                 tavily_snippets = content
@@ -1899,7 +1899,7 @@ def chat_discussion(user):
                         "https://api.groq.com/openai/v1/chat/completions",
                         json=payload,
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        stream=True, timeout=3000
+                        stream=True, timeout=None
                     )
                     if r.status_code in (401, 403, 429):
                         continue
@@ -1971,7 +1971,7 @@ def chat_discussion(user):
         if not has_groq:
             resp = None
         else:
-            resp, used_key = groq_request(payload, api_keys, timeout=3000)
+            resp, used_key = groq_request(payload, api_keys, timeout=None)
 
         if resp is None:
             ollama_prompt = build_ollama_prompt()
@@ -2180,7 +2180,7 @@ def espn_api(endpoint=""):
         query_string = request.query_string.decode('utf-8')
         if query_string:
             url += "?" + query_string
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2203,7 +2203,7 @@ def sportdb_api(endpoint=""):
         if api_key:
             headers['X-API-Key'] = api_key
             
-        resp = requests.get(url, headers=headers, timeout=300)
+        resp = requests.get(url, headers=headers, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2221,7 +2221,7 @@ def sportsrc_api(endpoint=""):
         query_string = request.query_string.decode('utf-8')
         if query_string:
             url += "?" + query_string
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2245,7 +2245,7 @@ def highlightly_api(endpoint=""):
             'X-RapidAPI-Host': 'highlightly-v2.p.rapidapi.com'
         }
         
-        resp = requests.get(url, headers=headers, timeout=300)
+        resp = requests.get(url, headers=headers, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2263,7 +2263,7 @@ def isports_api(endpoint=""):
         query_string = request.query_string.decode('utf-8')
         if query_string:
             url += "?" + query_string
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2279,7 +2279,7 @@ def cricapi_live_scores():
         return jsonify({"error": "API key required"}), 400
     try:
         url = f"https://api.cricapi.com/v1/cricScore?apikey={apikey}"
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2291,7 +2291,7 @@ def cricapi_scorecard(match_id):
         return jsonify({"error": "API key required"}), 400
     try:
         url = f"https://api.cricapi.com/v1/match_info?apikey={apikey}&id={match_id}"
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2320,18 +2320,12 @@ def track_reading(user):
     return jsonify({"status": "ok"})
 
 @app.route("/api/rotation-status")
-@require_auth
-def get_rotation_status(user):
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
+def get_rotation_status():
     groq_keys = ensure_list(os.getenv("GROQ_API_KEY", ""))
     return jsonify({"keys": _key_rotation.status(groq_keys), "active": len(groq_keys) > 1})
 
 @app.route("/api/rate-limits")
-@require_auth
-def get_rate_limits(user):
-    if not user:
-        return jsonify({"error": "unauthorized"}), 401
+def get_rate_limits():
     return jsonify({"rate_limits": "API rate limits info"})
 
 @app.route("/api/cricket/apicricket/live-scores", methods=["GET"])
@@ -2341,7 +2335,7 @@ def apicricket_live_scores():
         return jsonify({"error": "API key required"}), 400
     try:
         url = f"https://api.cricapi.com/v1/cricScore?apikey={apikey}"
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2353,7 +2347,7 @@ def apicricket_scorecard(event_key):
         return jsonify({"error": "API key required"}), 400
     try:
         url = f"https://api.cricapi.com/v1/match_info?apikey={apikey}&id={event_key}"
-        resp = requests.get(url, timeout=300)
+        resp = requests.get(url, timeout=None)
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2430,7 +2424,7 @@ def get_trends(user):
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_keys[0]}", "Content-Type": "application/json"},
                     json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 500},
-                    timeout=100,
+                    timeout=None,
                 )
                 if resp.ok:
                     content = resp.json()["choices"][0]["message"]["content"].strip()
@@ -2481,7 +2475,7 @@ def get_recommendations(user):
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_keys[0]}", "Content-Type": "application/json"},
                     json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 300},
-                    timeout=100,
+                    timeout=None,
                 )
                 if resp.ok:
                     content = resp.json()["choices"][0]["message"]["content"].strip()
@@ -2571,7 +2565,7 @@ def text_to_speech():
                 "model_id": "eleven_multilingual_v2",
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
             },
-            timeout=300,
+            timeout=None,
             stream=True
         )
         if resp.status_code != 200:
@@ -2606,7 +2600,7 @@ def youtube_search():
         resp = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
             params=params,
-            timeout=15
+            timeout=None
         )
         if resp.status_code != 200:
             return jsonify({"error": "YouTube API request failed", "detail": resp.text}), resp.status_code
