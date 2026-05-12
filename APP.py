@@ -193,9 +193,7 @@ def ensure_list(val):
     return []
 
 def _get_cipher():
-    secret_key = os.getenv('FLASK_SECRET_KEY')
-    if not secret_key:
-        raise RuntimeError("FLASK_SECRET_KEY environment variable must be set")
+    secret_key = os.getenv('FLASK_SECRET_KEY', 'truthlens_default_secret_key_2026')
     key = base64.urlsafe_b64encode(hashlib.sha256(secret_key.encode()).digest())
     return Fernet(key)
 
@@ -234,9 +232,7 @@ def decrypt_api_keys(encrypted):
 app = Flask(__name__)
 
 # Configuration
-SECRET_KEY = os.getenv('FLASK_SECRET_KEY')
-if not SECRET_KEY:
-    raise RuntimeError("FLASK_SECRET_KEY environment variable must be set")
+SECRET_KEY = os.getenv('FLASK_SECRET_KEY', 'truthlens_default_secret_key_2026')
 
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'development').lower()
 
